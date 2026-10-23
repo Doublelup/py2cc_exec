@@ -1,0 +1,40 @@
+[project]
+name = "py2cc"
+version = "0.1.0"
+description = "A small Ed25519-authenticated remote Bash execution protocol for a networking lab"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=49.0.0",
+]
+
+[project.scripts]
+py2cc_keygen = "remote_exec.keygen:main"
+py2cc_server = "py2cc_server:main"
+py2cc_client = "py2cc_client:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["remote_exec", "py2cc_server", "py2cc_client"]
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
