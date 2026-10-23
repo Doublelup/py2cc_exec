@@ -136,10 +136,31 @@ tool_timeout_sec = 330
 
 - `run_command(command, timeout_seconds)`：执行一条命令。
 - `run_commands(commands, timeout_seconds, stop_on_error)`：在同一连接中顺序执行多条命令。
+- `remote_read(file_path, offset, limit)`：读取远端 UTF-8 文本窗口，并返回整文件 SHA-256。
+- `remote_edit(file_path, old_string, new_string, expected_sha256, replace_all)`：仅在哈希仍匹配时精确替换文本。
+- `remote_write(file_path, content)`：创建或完整覆盖远端 UTF-8 文本文件。
 
-工具返回结构化的状态、退出码、stdout、stderr、截断标志和
+命令工具返回结构化的状态、退出码、stdout、stderr、截断标志和
 `outcome_unknown`。若 `outcome_unknown` 为 `true`，不要自动重试原命令。
-MCP 工具仍然没有 PTY，不适合 `vim`、`top`、密码提示或交互式 REPL。
+命令工具仍然没有 PTY，不适合 `vim`、`top`、密码提示或交互式 REPL。
+
+文件工具的典型流程是先读取再编辑：
+
+```text
+remote_read("src/example.py")
+  -> content + sha256
+remote_edit("src/example.py", old_string, new_string, expected_sha256=sha256)
+  -> replacements + 修改后的 sha256
+```
+
+如果文件在两次调用之间发生变化，`remote_edit` 返回 `stale_file`，且
+`sha256` 为 `null`；调用方必须重新读取文件。三个文件工具的结果中始终存在
+`sha256` 字段，成功时为操作后的整文件哈希，失败时为 `null`。
+`remote_write` 不进行哈希前置校验，它表示调用方明确要求完整覆盖文件。
+
+相对文件路径从 `py2cc_server --workdir` 解析，也可以传入绝对路径。服务端只处理
+UTF-8 普通文件，默认文件大小上限为 1 MiB，可通过 `--max-file-bytes` 调整；
+Read 每次最多返回 2000 行。写入使用同目录临时文件和原子替换，并保留已有文件权限。
 
 ## 两台主机和 VS Code 端口转发
 
@@ -162,12 +183,16 @@ uv run py2cc_client \
 消息使用 4 字节大端长度前缀和 JSON 正文：
 
 ```text
-A -> B: challenge(nonce_0, sequence=0)
+A -> B: challenge(nonce_0, sequence=0, capabilities=[...])
 B -> A: exec(command_0, nonce_0, sequence=0, signature)
 A -> B: result_0 + nonce_1
-B -> A: exec(command_1, nonce_1, sequence=1, signature)
+B -> A: read_file/edit_file/write_file(..., nonce_1, sequence=1, signature)
+A -> B: file_result_1 + nonce_2
 ```
 
-签名覆盖协议域标识、版本、序号、请求 UUID、nonce、完整命令和超时。A 在验签成功后、执行命令前立即作废当前 nonce。认证失败只关闭当前 TCP 会话，监听服务继续运行。
+签名覆盖协议域标识、版本、序号、请求 UUID、nonce 以及对应操作的全部参数。
+A 在验签成功后、执行操作前立即作废当前 nonce。认证失败只关闭当前 TCP 会话，
+监听服务继续运行。capabilities 为可选字段，因此新服务端仍兼容旧客户端；新客户端
+连接没有 capabilities 的旧服务端时仍可执行命令，但文件工具会返回 `unsupported`。
 
 连接可能在命令执行完成后、结果到达 B 前中断，因此 B 无法确定这类命令是否已经执行。客户端不会自动重试，非幂等命令也不应由调用方盲目重试。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import secrets
 import socket
 import socketserver
@@ -16,10 +17,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .crypto import load_public_key, verify_request
 from .executor import ExecutionResult, execute_bash
+from .files import FileOperationResult, edit_file, read_file, write_file
 from .protocol import (
+    FILE_REQUEST_TYPES,
+    MAX_FRAME_SIZE,
     NONCE_SIZE,
     PROTOCOL_VERSION,
+    SERVER_CAPABILITIES,
     SIGNATURE_SIZE,
+    SIGNED_REQUEST_FIELDS,
     ProtocolError,
     decode_bytes,
     encode_bytes,
@@ -28,6 +34,10 @@ from .protocol import (
 )
 
 LOG = logging.getLogger("py2cc_server")
+MAX_READ_LINES = 2000
+# JSON can expand one control byte to a six-byte ``\u00xx`` escape.
+MAX_CONFIGURED_FILE_BYTES = (MAX_FRAME_SIZE - 64 * 1024) // 6
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class AuthenticationError(Exception):
@@ -42,6 +52,7 @@ class ServerConfig:
     max_timeout: int = 300
     max_command_bytes: int = 64 * 1024
     max_output_bytes: int = 1024 * 1024
+    max_file_bytes: int = 1024 * 1024
     idle_timeout: int = 600
 
 
@@ -52,34 +63,51 @@ def _require_int(message: dict[str, Any], field: str, *, minimum: int = 0) -> in
     return value
 
 
-def _validate_request_shape(message: dict[str, Any]) -> tuple[bytes, bytes]:
-    expected = {
-        "type",
-        "version",
-        "sequence",
-        "request_id",
-        "nonce",
-        "command",
-        "timeout_seconds",
-        "signature",
-    }
+def _validate_request_shape(message: dict[str, Any]) -> tuple[str, bytes, bytes]:
+    request_type = message.get("type")
+    if not isinstance(request_type, str) or request_type not in SIGNED_REQUEST_FIELDS:
+        raise ProtocolError("unsupported request type")
+    expected = {*SIGNED_REQUEST_FIELDS[request_type], "signature"}
     if set(message) != expected:
         raise ProtocolError("request has missing or unknown fields")
-    if message["type"] != "exec" or message["version"] != PROTOCOL_VERSION:
-        raise ProtocolError("unsupported request type or protocol version")
+    if type(message["version"]) is not int or message["version"] != PROTOCOL_VERSION:
+        raise ProtocolError("unsupported protocol version")
     _require_int(message, "sequence")
-    _require_int(message, "timeout_seconds", minimum=1)
-    if not isinstance(message["command"], str):
-        raise ProtocolError("command must be a string")
     try:
         parsed_id = uuid.UUID(message["request_id"])
     except (AttributeError, TypeError, ValueError) as exc:
         raise ProtocolError("request_id must be a UUID") from exc
     if str(parsed_id) != message["request_id"]:
         raise ProtocolError("request_id must use canonical UUID form")
+
+    if request_type == "exec":
+        _require_int(message, "timeout_seconds", minimum=1)
+        if not isinstance(message["command"], str):
+            raise ProtocolError("command must be a string")
+    elif request_type == "read_file":
+        if not isinstance(message["file_path"], str):
+            raise ProtocolError("file_path must be a string")
+        _require_int(message, "offset", minimum=1)
+        limit = _require_int(message, "limit", minimum=1)
+        if limit > MAX_READ_LINES:
+            raise ProtocolError(f"limit must be <= {MAX_READ_LINES}")
+    elif request_type == "edit_file":
+        for field in ("file_path", "old_string", "new_string", "expected_sha256"):
+            if not isinstance(message[field], str):
+                raise ProtocolError(f"{field} must be a string")
+        if type(message["replace_all"]) is not bool:
+            raise ProtocolError("replace_all must be a boolean")
+        if not SHA256_PATTERN.fullmatch(message["expected_sha256"]):
+            raise ProtocolError("expected_sha256 must be 64 lowercase hexadecimal characters")
+    elif request_type == "write_file":
+        if not isinstance(message["file_path"], str):
+            raise ProtocolError("file_path must be a string")
+        if not isinstance(message["content"], str):
+            raise ProtocolError("content must be a string")
+
     nonce = decode_bytes(message["nonce"], expected_length=NONCE_SIZE)
     signature = decode_bytes(message["signature"], expected_length=SIGNATURE_SIZE)
-    return nonce, signature
+    return request_type, nonce, signature
 
 
 def _send_error(sock: socket.socket, code: str, message: str) -> None:
@@ -119,6 +147,57 @@ def _result_message(
     }
 
 
+def _file_result_message(
+    *,
+    sequence: int,
+    request_id: str,
+    operation: str,
+    result: FileOperationResult,
+    next_nonce: bytes,
+) -> dict[str, Any]:
+    return {
+        "type": "file_result",
+        "version": PROTOCOL_VERSION,
+        "sequence": sequence,
+        "request_id": request_id,
+        "operation": operation,
+        "status": result.status,
+        "message": result.message,
+        "data": result.data,
+        "next_nonce": encode_bytes(next_nonce),
+    }
+
+
+def _execute_file_request(message: dict[str, Any], config: ServerConfig) -> FileOperationResult:
+    request_type = message["type"]
+    if request_type == "read_file":
+        return read_file(
+            workdir=config.workdir,
+            file_path=message["file_path"],
+            offset=message["offset"],
+            limit=message["limit"],
+            max_file_bytes=config.max_file_bytes,
+        )
+    if request_type == "edit_file":
+        return edit_file(
+            workdir=config.workdir,
+            file_path=message["file_path"],
+            old_string=message["old_string"],
+            new_string=message["new_string"],
+            expected_sha256=message["expected_sha256"],
+            replace_all=message["replace_all"],
+            max_file_bytes=config.max_file_bytes,
+        )
+    if request_type == "write_file":
+        return write_file(
+            workdir=config.workdir,
+            file_path=message["file_path"],
+            content=message["content"],
+            max_file_bytes=config.max_file_bytes,
+        )
+    return FileOperationResult("unsupported", "file operation is not supported")
+
+
 class RemoteExecHandler(socketserver.BaseRequestHandler):
     server: "RemoteExecTCPServer"
 
@@ -135,13 +214,14 @@ class RemoteExecHandler(socketserver.BaseRequestHandler):
                 "version": PROTOCOL_VERSION,
                 "sequence": sequence,
                 "nonce": encode_bytes(nonce),
+                "capabilities": list(SERVER_CAPABILITIES),
             },
         )
 
         while True:
             try:
                 message = recv_message(sock)
-                received_nonce, signature = _validate_request_shape(message)
+                request_type, received_nonce, signature = _validate_request_shape(message)
                 if message["sequence"] != sequence:
                     raise AuthenticationError("sequence mismatch")
                 if not secrets.compare_digest(received_nonce, nonce):
@@ -160,46 +240,62 @@ class RemoteExecHandler(socketserver.BaseRequestHandler):
             except OSError:
                 return
 
-            # The authenticated nonce is consumed before command validation or execution.
+            # The authenticated nonce is consumed before operation validation or execution.
             nonce = b""
-            command = message["command"]
-            timeout_seconds = message["timeout_seconds"]
-            command_size = len(command.encode("utf-8"))
+            next_nonce = secrets.token_bytes(NONCE_SIZE)
+            if request_type == "exec":
+                command = message["command"]
+                timeout_seconds = message["timeout_seconds"]
+                command_size = len(command.encode("utf-8"))
 
-            if command_size > config.max_command_bytes:
-                result = ExecutionResult(
-                    status="rejected",
-                    exit_code=None,
-                    stdout=b"",
-                    stderr=b"command exceeds the server size limit",
-                )
-            elif timeout_seconds > config.max_timeout:
-                result = ExecutionResult(
-                    status="rejected",
-                    exit_code=None,
-                    stdout=b"",
-                    stderr=b"requested timeout exceeds the server limit",
+                if command_size > config.max_command_bytes:
+                    result = ExecutionResult(
+                        status="rejected",
+                        exit_code=None,
+                        stdout=b"",
+                        stderr=b"command exceeds the server size limit",
+                    )
+                elif timeout_seconds > config.max_timeout:
+                    result = ExecutionResult(
+                        status="rejected",
+                        exit_code=None,
+                        stdout=b"",
+                        stderr=b"requested timeout exceeds the server limit",
+                    )
+                else:
+                    result = execute_bash(
+                        command,
+                        bash_path=config.bash_path,
+                        workdir=config.workdir,
+                        timeout_seconds=timeout_seconds,
+                        max_output_bytes=config.max_output_bytes,
+                    )
+                response = _result_message(
+                    sequence=sequence,
+                    request_id=message["request_id"],
+                    result=result,
+                    next_nonce=next_nonce,
                 )
             else:
-                result = execute_bash(
-                    command,
-                    bash_path=config.bash_path,
-                    workdir=config.workdir,
-                    timeout_seconds=timeout_seconds,
-                    max_output_bytes=config.max_output_bytes,
+                assert request_type in FILE_REQUEST_TYPES
+                try:
+                    file_result = _execute_file_request(message, config)
+                except Exception:
+                    LOG.exception("unexpected file operation failure")
+                    file_result = FileOperationResult(
+                        "io_error",
+                        "internal file operation error",
+                    )
+                response = _file_result_message(
+                    sequence=sequence,
+                    request_id=message["request_id"],
+                    operation=request_type,
+                    result=file_result,
+                    next_nonce=next_nonce,
                 )
 
-            next_nonce = secrets.token_bytes(NONCE_SIZE)
             try:
-                send_message(
-                    sock,
-                    _result_message(
-                        sequence=sequence,
-                        request_id=message["request_id"],
-                        result=result,
-                        next_nonce=next_nonce,
-                    ),
-                )
+                send_message(sock, response)
             except (OSError, ProtocolError):
                 return
             nonce = next_nonce
@@ -225,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-timeout", type=int, default=300)
     parser.add_argument("--max-command-bytes", type=int, default=64 * 1024)
     parser.add_argument("--max-output-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--max-file-bytes", type=int, default=1024 * 1024)
     parser.add_argument("--idle-timeout", type=int, default=600)
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -241,8 +338,16 @@ def main() -> None:
         raise SystemExit(f"workdir is not a directory: {workdir}")
     if args.max_timeout < 1:
         raise SystemExit("max-timeout must be >= 1")
-    if args.max_command_bytes < 1 or args.max_output_bytes < 1:
-        raise SystemExit("command and output limits must be >= 1")
+    if (
+        args.max_command_bytes < 1
+        or args.max_output_bytes < 1
+        or args.max_file_bytes < 1
+    ):
+        raise SystemExit("command, output, and file limits must be >= 1")
+    if args.max_file_bytes > MAX_CONFIGURED_FILE_BYTES:
+        raise SystemExit(
+            f"max-file-bytes must be <= {MAX_CONFIGURED_FILE_BYTES} to fit a protocol frame"
+        )
     if args.idle_timeout < 1:
         raise SystemExit("idle-timeout must be >= 1")
 
@@ -253,6 +358,7 @@ def main() -> None:
         max_timeout=args.max_timeout,
         max_command_bytes=args.max_command_bytes,
         max_output_bytes=args.max_output_bytes,
+        max_file_bytes=args.max_file_bytes,
         idle_timeout=args.idle_timeout,
     )
     with RemoteExecTCPServer((args.host, args.port), config) as server:

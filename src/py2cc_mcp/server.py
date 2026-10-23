@@ -11,19 +11,27 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field
 
-from remote_exec.client import CommandResult, RemoteError, RemoteExecClient
+from remote_exec.client import CommandResult, FileResult, RemoteError, RemoteExecClient
 from remote_exec.crypto import InvalidKeyError, load_private_key
 from remote_exec.protocol import ProtocolError
 
 LOG = logging.getLogger("py2cc_mcp")
 
-MCP_INSTRUCTIONS = """Use these tools only for user-authorized, non-interactive Bash work on the configured Py2CC host. Calls may modify the remote host and are not idempotent. Commands run in independent Bash processes without a PTY, so do not use vim, top, password prompts, or other interactive programs. Never retry a command when outcome_unknown is true."""
+MCP_INSTRUCTIONS = (
+    "Use these tools only for user-authorized work on the configured Py2CC host. "
+    "Use remote_read before remote_edit and pass back the returned SHA-256; "
+    "stale_file means the file must be read again. remote_write intentionally "
+    "creates or fully overwrites a file. Commands run in independent "
+    "non-interactive Bash processes without a PTY. Never retry a mutating "
+    "operation when outcome_unknown is true."
+)
 
 RUN_ANNOTATIONS = ToolAnnotations(
     title="Run remote Bash commands through Py2CC",
@@ -32,6 +40,109 @@ RUN_ANNOTATIONS = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+
+READ_ANNOTATIONS = ToolAnnotations(
+    title="Read a remote UTF-8 text file through Py2CC",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
+EDIT_ANNOTATIONS = ToolAnnotations(
+    title="Edit a remote UTF-8 text file through Py2CC",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+
+WRITE_ANNOTATIONS = ToolAnnotations(
+    title="Write a remote UTF-8 text file through Py2CC",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+
+ResultSha256 = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Lowercase whole-file SHA-256 after a successful operation; null on failure."
+        )
+    ),
+]
+
+
+class CommandToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    request_id: str | None
+    status: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    outcome_unknown: bool
+
+
+class BatchCommandToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    status: str
+    results: list[CommandToolResult]
+    executed_count: int
+    requested_count: int
+    outcome_unknown: bool
+    error: str | None
+
+
+class RemoteReadToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    status: str
+    message: str
+    request_id: str | None
+    sha256: ResultSha256
+    outcome_unknown: bool
+    file_path: str | None
+    content: Annotated[str, Field(description="Requested raw UTF-8 line window.")]
+    start_line: int | None
+    end_line: int | None
+    total_lines: int | None
+
+
+class RemoteEditToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    status: str
+    message: str
+    request_id: str | None
+    sha256: ResultSha256
+    outcome_unknown: bool
+    file_path: str | None
+    replacements: int | None
+
+
+class RemoteWriteToolResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    status: str
+    message: str
+    request_id: str | None
+    sha256: ResultSha256
+    outcome_unknown: bool
+    file_path: str | None
+    created: bool | None
+    changed: bool | None
+    bytes_written: int | None
 
 
 @dataclass(frozen=True)
@@ -72,6 +183,60 @@ def _command_result(result: CommandResult) -> dict[str, Any]:
         "stderr_truncated": result.stderr_truncated,
         "outcome_unknown": False,
     }
+
+
+def _empty_file_result(
+    operation: str,
+    status: str,
+    message: str,
+    *,
+    outcome_unknown: bool,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "ok": False,
+        "status": status,
+        "message": message,
+        "request_id": None,
+        "sha256": None,
+        "outcome_unknown": outcome_unknown,
+        "file_path": None,
+    }
+    if operation == "read_file":
+        base.update(content="", start_line=None, end_line=None, total_lines=None)
+    elif operation == "edit_file":
+        base.update(replacements=None)
+    elif operation == "write_file":
+        base.update(created=None, changed=None, bytes_written=None)
+    return base
+
+
+def _file_result(result: FileResult) -> dict[str, Any]:
+    data = result.data if result.ok else {}
+    base: dict[str, Any] = {
+        "ok": result.ok,
+        "status": result.status,
+        "message": result.message,
+        "request_id": result.request_id,
+        "sha256": result.sha256 if result.ok else None,
+        "outcome_unknown": False,
+        "file_path": data.get("file_path"),
+    }
+    if result.operation == "read_file":
+        base.update(
+            content=data.get("content", ""),
+            start_line=data.get("start_line"),
+            end_line=data.get("end_line"),
+            total_lines=data.get("total_lines"),
+        )
+    elif result.operation == "edit_file":
+        base.update(replacements=data.get("replacements"))
+    elif result.operation == "write_file":
+        base.update(
+            created=data.get("created"),
+            changed=data.get("changed"),
+            bytes_written=data.get("bytes_written"),
+        )
+    return base
 
 
 class Py2CCSession:
@@ -216,6 +381,79 @@ class Py2CCSession:
             "error": None,
         }
 
+    def _file_operation_locked(
+        self,
+        operation: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        connection_error = self._connect_locked()
+        if connection_error is not None:
+            return _empty_file_result(
+                operation,
+                connection_error["status"],
+                connection_error["stderr"],
+                outcome_unknown=False,
+            )
+        assert self._client is not None
+        try:
+            method = getattr(self._client, operation)
+            return _file_result(method(*args, **kwargs))
+        except ValueError as exc:
+            return _empty_file_result(
+                operation,
+                "invalid_request",
+                str(exc),
+                outcome_unknown=False,
+            )
+        except RemoteError as exc:
+            self._drop_client_locked()
+            return _empty_file_result(
+                operation,
+                "remote_error",
+                f"{type(exc).__name__}: {exc}",
+                outcome_unknown=False,
+            )
+        except (OSError, EOFError, ProtocolError) as exc:
+            self._drop_client_locked()
+            return _empty_file_result(
+                operation,
+                "transport_error",
+                f"{type(exc).__name__}: {exc}",
+                outcome_unknown=True,
+            )
+
+    def remote_read(self, file_path: str, offset: int, limit: int) -> dict[str, Any]:
+        with self._lock:
+            return self._file_operation_locked(
+                "read_file",
+                file_path,
+                offset=offset,
+                limit=limit,
+            )
+
+    def remote_edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        expected_sha256: str,
+        replace_all: bool,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._file_operation_locked(
+                "edit_file",
+                file_path,
+                old_string,
+                new_string,
+                expected_sha256,
+                replace_all=replace_all,
+            )
+
+    def remote_write(self, file_path: str, content: str) -> dict[str, Any]:
+        with self._lock:
+            return self._file_operation_locked("write_file", file_path, content)
+
     def close(self) -> None:
         with self._lock:
             self._drop_client_locked()
@@ -234,8 +472,13 @@ def create_mcp_server(session: Py2CCSession, *, log_level: str = "INFO") -> Fast
         annotations=RUN_ANNOTATIONS,
         structured_output=True,
     )
-    def run_command(command: str, timeout_seconds: int | None = None) -> dict[str, Any]:
-        return session.run_command(command, timeout_seconds)
+    def run_command(
+        command: str,
+        timeout_seconds: int | None = None,
+    ) -> CommandToolResult:
+        return CommandToolResult.model_validate(
+            session.run_command(command, timeout_seconds)
+        )
 
     @server.tool(
         name="run_commands",
@@ -247,8 +490,122 @@ def create_mcp_server(session: Py2CCSession, *, log_level: str = "INFO") -> Fast
         commands: list[str],
         timeout_seconds: int | None = None,
         stop_on_error: bool = True,
-    ) -> dict[str, Any]:
-        return session.run_commands(commands, timeout_seconds, stop_on_error)
+    ) -> BatchCommandToolResult:
+        return BatchCommandToolResult.model_validate(
+            session.run_commands(commands, timeout_seconds, stop_on_error)
+        )
+
+    @server.tool(
+        name="remote_read",
+        description=(
+            "Read a line window from a remote UTF-8 text file and return the "
+            "SHA-256 of the entire file. Relative paths use the Py2CC server "
+            "workdir. This read-only operation is safe to retry."
+        ),
+        annotations=READ_ANNOTATIONS,
+        structured_output=True,
+    )
+    def remote_read(
+        file_path: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description=(
+                    "Absolute remote path, or a path relative to the server workdir."
+                ),
+            ),
+        ],
+        offset: Annotated[
+            int,
+            Field(ge=1, description="One-based first line to return."),
+        ] = 1,
+        limit: Annotated[
+            int,
+            Field(ge=1, le=2000, description="Maximum number of lines to return."),
+        ] = 2000,
+    ) -> RemoteReadToolResult:
+        return RemoteReadToolResult.model_validate(
+            session.remote_read(file_path, offset, limit)
+        )
+
+    @server.tool(
+        name="remote_edit",
+        description=(
+            "Replace exact text in an existing remote UTF-8 file only when its "
+            "current SHA-256 matches expected_sha256. Call remote_read again "
+            "after stale_file. Do not retry automatically when outcome_unknown is true."
+        ),
+        annotations=EDIT_ANNOTATIONS,
+        structured_output=True,
+    )
+    def remote_edit(
+        file_path: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description=(
+                    "Absolute remote path, or a path relative to the server workdir."
+                ),
+            ),
+        ],
+        old_string: Annotated[
+            str,
+            Field(min_length=1, description="Exact UTF-8 text to replace."),
+        ],
+        new_string: Annotated[
+            str,
+            Field(description="Replacement text; empty deletes the match."),
+        ],
+        expected_sha256: Annotated[
+            str,
+            Field(
+                pattern=r"^[0-9a-f]{64}$",
+                description="Whole-file SHA-256 returned by remote_read.",
+            ),
+        ],
+        replace_all: Annotated[
+            bool,
+            Field(description="Replace every match instead of requiring exactly one."),
+        ] = False,
+    ) -> RemoteEditToolResult:
+        return RemoteEditToolResult.model_validate(
+            session.remote_edit(
+                file_path,
+                old_string,
+                new_string,
+                expected_sha256,
+                replace_all,
+            )
+        )
+
+    @server.tool(
+        name="remote_write",
+        description=(
+            "Create or completely overwrite a remote UTF-8 text file. Parent "
+            "directories must already exist. Do not retry automatically when "
+            "outcome_unknown is true."
+        ),
+        annotations=WRITE_ANNOTATIONS,
+        structured_output=True,
+    )
+    def remote_write(
+        file_path: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description=(
+                    "Absolute remote path, or a path relative to the server workdir."
+                ),
+            ),
+        ],
+        content: Annotated[
+            str,
+            Field(description="Complete UTF-8 contents for the remote file."),
+        ],
+    ) -> RemoteWriteToolResult:
+        return RemoteWriteToolResult.model_validate(
+            session.remote_write(file_path, content)
+        )
 
     return server
 

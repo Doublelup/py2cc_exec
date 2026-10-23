@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shlex
 import socket
 import threading
@@ -57,6 +58,50 @@ def test_persistent_connection_and_bash_features(
     assert second.exit_code == 7
     assert first_nonce != second_nonce
     assert client.sequence == 2
+
+
+def test_file_operations_share_connection_nonce_and_hash_contract(
+    running_server: tuple[RemoteExecTCPServer, Ed25519PrivateKey],
+    tmp_path: Path,
+) -> None:
+    server, private_key = running_server
+    with _client(server, private_key) as client:
+        assert client.server_capabilities == {
+            "exec",
+            "read_file",
+            "edit_file",
+            "write_file",
+        }
+        written = client.write_file("notes.txt", "alpha\nbeta\ngamma\n")
+        read = client.read_file("notes.txt", offset=2, limit=1)
+        edited = client.edit_file(
+            str(tmp_path / "notes.txt"),
+            "beta",
+            "BETA",
+            read.data["sha256"],
+        )
+        stale = client.edit_file(
+            "notes.txt",
+            "gamma",
+            "GAMMA",
+            read.data["sha256"],
+        )
+        final = client.execute("printf done")
+
+    assert written.status == "completed"
+    assert written.data["sha256"] == hashlib.sha256(
+        b"alpha\nbeta\ngamma\n"
+    ).hexdigest()
+    assert read.data["content"] == "beta\n"
+    assert read.data["start_line"] == 2
+    assert edited.status == "completed"
+    assert edited.data["sha256"] == hashlib.sha256(
+        b"alpha\nBETA\ngamma\n"
+    ).hexdigest()
+    assert stale.status == "stale_file"
+    assert stale.data == {}
+    assert final.stdout == b"done"
+    assert client.sequence == 5
 
 
 def test_timeout_and_output_limit_keep_connection_usable(
@@ -117,4 +162,62 @@ def test_wrong_private_key_is_rejected(
 
     with _client(server, good_key) as good_client:
         assert good_client.execute("printf accepted").stdout == b"accepted"
+
+
+def test_new_client_keeps_exec_compatibility_with_server_without_capabilities() -> None:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def old_server() -> None:
+        conn, _ = listener.accept()
+        try:
+            send_message(
+                conn,
+                {
+                    "type": "challenge",
+                    "version": PROTOCOL_VERSION,
+                    "sequence": 0,
+                    "nonce": encode_bytes(b"n" * 32),
+                },
+            )
+            request = recv_message(conn)
+            send_message(
+                conn,
+                {
+                    "type": "result",
+                    "version": PROTOCOL_VERSION,
+                    "sequence": 0,
+                    "request_id": request["request_id"],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "stdout": encode_bytes(b"old-server"),
+                    "stderr": encode_bytes(b""),
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "next_nonce": encode_bytes(b"m" * 32),
+                },
+            )
+        finally:
+            conn.close()
+            listener.close()
+
+    thread = threading.Thread(target=old_server)
+    thread.start()
+    private_key = Ed25519PrivateKey.generate()
+    client = RemoteExecClient(*listener.getsockname(), private_key)
+    try:
+        client.connect()
+        capabilities = client.server_capabilities
+        unsupported = client.read_file("anything.txt")
+        command = client.execute("printf compatible")
+    finally:
+        client.close()
+        thread.join()
+
+    assert capabilities == {"exec"}
+    assert unsupported.status == "unsupported"
+    assert unsupported.request_id is None
+    assert unsupported.sha256 is None
+    assert command.stdout == b"old-server"
 

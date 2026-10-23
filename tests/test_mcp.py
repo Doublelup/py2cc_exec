@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import sys
 import threading
 from collections.abc import Iterator
@@ -16,13 +17,18 @@ from mcp.client.stdio import stdio_client
 from py2cc_mcp import MCPClientConfig, Py2CCSession, create_mcp_server
 from py2cc_mcp.server import _load_mcp_config
 from py2cc_server import RemoteExecTCPServer, ServerConfig
-from remote_exec.client import CommandResult
+from remote_exec.client import CommandResult, FileResult
 from remote_exec.crypto import generate_keypair
 
 
 class FakeClient:
-    def __init__(self, outcomes: list[CommandResult | BaseException]) -> None:
+    def __init__(
+        self,
+        outcomes: list[CommandResult | BaseException],
+        file_outcomes: list[FileResult | BaseException] | None = None,
+    ) -> None:
         self.outcomes = outcomes
+        self.file_outcomes = file_outcomes or []
         self.connect_calls = 0
         self.close_calls = 0
         self.executed: list[tuple[str, int]] = []
@@ -39,6 +45,21 @@ class FakeClient:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+    def _file_result(self) -> FileResult:
+        outcome = self.file_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def read_file(self, *args: object, **kwargs: object) -> FileResult:
+        return self._file_result()
+
+    def edit_file(self, *args: object, **kwargs: object) -> FileResult:
+        return self._file_result()
+
+    def write_file(self, *args: object, **kwargs: object) -> FileResult:
+        return self._file_result()
 
 
 def _result(request_id: str, *, exit_code: int = 0) -> CommandResult:
@@ -131,17 +152,53 @@ def test_connection_failure_has_known_outcome_and_is_not_retried() -> None:
     assert fake.executed == []
 
 
-def test_mcp_registers_both_destructive_tools() -> None:
+def test_mcp_registers_tools_with_concrete_file_schemas() -> None:
     fake = FakeClient([_result("unused")])
     session = Py2CCSession(_config(), client_factory=lambda *args, **kwargs: fake)
     server = create_mcp_server(session)
 
     tools = asyncio.run(server.list_tools())
 
-    assert {tool.name for tool in tools} == {"run_command", "run_commands"}
+    assert {tool.name for tool in tools} == {
+        "run_command",
+        "run_commands",
+        "remote_read",
+        "remote_edit",
+        "remote_write",
+    }
     assert all(tool.annotations is not None for tool in tools)
-    assert all(tool.annotations.destructiveHint is True for tool in tools if tool.annotations)
-    assert all(tool.annotations.idempotentHint is False for tool in tools if tool.annotations)
+    by_name = {tool.name: tool for tool in tools}
+    assert by_name["run_command"].outputSchema is not None
+    assert by_name["run_command"].outputSchema["additionalProperties"] is False
+    assert "outcome_unknown" in by_name["run_command"].outputSchema["properties"]
+    assert by_name["remote_read"].annotations is not None
+    assert by_name["remote_read"].annotations.readOnlyHint is True
+    assert by_name["remote_edit"].annotations is not None
+    assert by_name["remote_edit"].annotations.destructiveHint is True
+    edit_schema = by_name["remote_edit"].inputSchema
+    assert set(edit_schema["required"]) == {
+        "file_path",
+        "old_string",
+        "new_string",
+        "expected_sha256",
+    }
+    assert edit_schema["properties"]["replace_all"]["default"] is False
+    for name in ("remote_read", "remote_edit", "remote_write"):
+        output_schema = by_name[name].outputSchema
+        assert output_schema is not None
+        assert "sha256" in output_schema["properties"]
+        assert "sha256" in output_schema["required"]
+
+
+def test_file_transport_failure_has_null_hash_and_unknown_outcome() -> None:
+    fake = FakeClient([], [EOFError("lost")])
+    session = Py2CCSession(_config(), client_factory=lambda *args, **kwargs: fake)
+
+    result = session.remote_write("file.txt", "contents")
+
+    assert result["status"] == "transport_error"
+    assert result["sha256"] is None
+    assert result["outcome_unknown"] is True
 
 
 @pytest.fixture
@@ -223,6 +280,9 @@ def test_stdio_mcp_round_trip(
                 assert {tool.name for tool in tools.tools} == {
                     "run_command",
                     "run_commands",
+                    "remote_read",
+                    "remote_edit",
+                    "remote_write",
                 }
                 response = await client.call_tool(
                     "run_commands",
@@ -237,6 +297,51 @@ def test_stdio_mcp_round_trip(
                 assert [
                     item["stdout"] for item in response.structuredContent["results"]
                 ] == ["alpha", "beta"]
+
+                written = await client.call_tool(
+                    "remote_write",
+                    {"file_path": "mcp.txt", "content": "one\ntwo\n"},
+                )
+                assert written.isError is False
+                assert written.structuredContent is not None
+                first_hash = written.structuredContent["sha256"]
+                assert first_hash == hashlib.sha256(b"one\ntwo\n").hexdigest()
+
+                read = await client.call_tool(
+                    "remote_read",
+                    {"file_path": "mcp.txt", "offset": 2, "limit": 1},
+                )
+                assert read.structuredContent is not None
+                assert read.structuredContent["content"] == "two\n"
+                assert read.structuredContent["sha256"] == first_hash
+
+                edited = await client.call_tool(
+                    "remote_edit",
+                    {
+                        "file_path": "mcp.txt",
+                        "old_string": "two",
+                        "new_string": "TWO",
+                        "expected_sha256": first_hash,
+                    },
+                )
+                assert edited.structuredContent is not None
+                assert edited.structuredContent["replacements"] == 1
+                assert edited.structuredContent["sha256"] == hashlib.sha256(
+                    b"one\nTWO\n"
+                ).hexdigest()
+
+                stale = await client.call_tool(
+                    "remote_edit",
+                    {
+                        "file_path": "mcp.txt",
+                        "old_string": "one",
+                        "new_string": "ONE",
+                        "expected_sha256": first_hash,
+                    },
+                )
+                assert stale.structuredContent is not None
+                assert stale.structuredContent["status"] == "stale_file"
+                assert stale.structuredContent["sha256"] is None
 
     asyncio.run(exercise())
 

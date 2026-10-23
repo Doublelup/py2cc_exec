@@ -15,16 +15,67 @@ NONCE_SIZE = 32
 SIGNATURE_SIZE = 64
 MAX_FRAME_SIZE = 8 * 1024 * 1024
 
-SIGNED_REQUEST_FIELDS = (
+COMMON_SIGNED_REQUEST_FIELDS = (
     "type",
     "version",
     "sequence",
     "request_id",
     "nonce",
-    "command",
-    "timeout_seconds",
 )
 
+SIGNED_REQUEST_FIELDS: dict[str, tuple[str, ...]] = {
+    "exec": COMMON_SIGNED_REQUEST_FIELDS
+    + (
+        "command",
+        "timeout_seconds",
+    ),
+    "read_file": COMMON_SIGNED_REQUEST_FIELDS
+    + (
+        "file_path",
+        "offset",
+        "limit",
+    ),
+    "edit_file": COMMON_SIGNED_REQUEST_FIELDS
+    + (
+        "file_path",
+        "old_string",
+        "new_string",
+        "expected_sha256",
+        "replace_all",
+    ),
+    "write_file": COMMON_SIGNED_REQUEST_FIELDS
+    + (
+        "file_path",
+        "content",
+    ),
+}
+
+SERVER_CAPABILITIES = (
+    "exec",
+    "read_file",
+    "edit_file",
+    "write_file",
+)
+
+FILE_REQUEST_TYPES = {
+    "read_file",
+    "edit_file",
+    "write_file",
+}
+
+FILE_RESULT_STATUSES = {
+    "completed",
+    "unsupported",
+    "stale_file",
+    "not_found",
+    "not_file",
+    "not_utf8",
+    "file_too_large",
+    "no_match",
+    "ambiguous_match",
+    "invalid_request",
+    "io_error",
+}
 
 class ProtocolError(Exception):
     """Raised when a peer sends an invalid protocol message."""
@@ -60,8 +111,13 @@ def canonical_json(message: Mapping[str, Any]) -> bytes:
 
 
 def request_signing_bytes(request: Mapping[str, Any]) -> bytes:
+    request_type = request.get("type")
+    if not isinstance(request_type, str) or request_type not in SIGNED_REQUEST_FIELDS:
+        raise ProtocolError("unsupported signed request type")
     try:
-        signed_request = {field: request[field] for field in SIGNED_REQUEST_FIELDS}
+        signed_request = {
+            field: request[field] for field in SIGNED_REQUEST_FIELDS[request_type]
+        }
     except KeyError as exc:
         raise ProtocolError(f"missing signed field: {exc.args[0]}") from exc
     return SIGNING_DOMAIN + canonical_json(signed_request)
@@ -106,7 +162,12 @@ def recv_message(sock: Any, *, max_frame_size: int = MAX_FRAME_SIZE) -> dict[str
     return decode_message(recv_exact(sock, size))
 
 
-def send_message(sock: Any, message: Mapping[str, Any], *, max_frame_size: int = MAX_FRAME_SIZE) -> None:
+def send_message(
+    sock: Any,
+    message: Mapping[str, Any],
+    *,
+    max_frame_size: int = MAX_FRAME_SIZE,
+) -> None:
     payload = canonical_json(message)
     if not payload or len(payload) > max_frame_size:
         raise ProtocolError(f"invalid outgoing frame size: {len(payload)}")
