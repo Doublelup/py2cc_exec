@@ -70,6 +70,77 @@ uv run py2cc_client --private-key keys/client.key --host 127.0.0.1 --port 9000
 
 输入 `:quit` 或按 `Ctrl-D` 退出客户端。
 
+## MCP 接入 Codex
+
+项目同时提供本地 stdio MCP server。它在进程生命周期内保留一个
+`RemoteExecClient`，因此连续的工具调用会复用 TCP 连接和 nonce 链。
+
+从 `py2cc_exec` 目录手动启动：
+
+```bash
+uv run py2cc_mcp \
+  --private-key keys/client.key \
+  --host 127.0.0.1 \
+  --port 18003 \
+  --default-timeout 30
+```
+
+私钥必须是 `py2cc_keygen --no-passphrase` 生成的无口令 PEM，且权限不得宽于
+`600`。MCP 使用 stdin/stdout 传输协议，因此不能在启动时交互输入私钥口令。
+
+若目录结构为：
+
+```text
+py2cc/
+├── .codex/config.toml
+└── py2cc_exec/
+```
+
+外层项目配置会以端口 `18003` 启动这个 MCP server。先同步依赖并确认配置：
+
+```bash
+cd py2cc/py2cc_exec
+uv sync
+cd ..
+codex
+```
+
+首次从外层 `py2cc` 目录启动 Codex 时，需要将该项目标记为可信；项目级配置只在
+新会话启动时加载。`codex mcp list` 主要用于管理用户级配置，在部分版本中不会
+列出项目级 MCP，因此应在新会话中实际调用一次 `run_command` 来确认连接。
+
+外层 `.codex/config.toml` 的配置如下。相对路径以 `.codex/` 为基准，因此
+`cwd = ".."` 指向外层项目目录：
+
+```toml
+[mcp_servers.py2cc]
+command = "uv"
+args = [
+  "run",
+  "--project",
+  "py2cc_exec",
+  "py2cc_mcp",
+  "--private-key",
+  "py2cc_exec/keys/client.key",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "18003",
+]
+cwd = ".."
+startup_timeout_sec = 20
+tool_timeout_sec = 330
+```
+
+在可信的 `py2cc` 项目中启动新 Codex 会话后，可使用：
+
+- `run_command(command, timeout_seconds)`：执行一条命令。
+- `run_commands(commands, timeout_seconds, stop_on_error)`：在同一连接中顺序执行多条命令。
+
+工具返回结构化的状态、退出码、stdout、stderr、截断标志和
+`outcome_unknown`。若 `outcome_unknown` 为 `true`，不要自动重试原命令。
+MCP 工具仍然没有 PTY，不适合 `vim`、`top`、密码提示或交互式 REPL。
+
 ## 两台主机和 VS Code 端口转发
 
 1. 在 A 上启动服务，仍然只监听 `127.0.0.1:9000`。
